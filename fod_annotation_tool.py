@@ -20,8 +20,16 @@ from tkinter import ttk, filedialog, messagebox
 from PIL import Image, ImageTk
 import os
 import json
+import numpy as np
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Dict, Any
+
+# tifffile 用于读取 PIL 无法处理的 TIFF 格式
+try:
+    import tifffile as _tifffile
+    HAS_TIFFFILE = True
+except ImportError:
+    HAS_TIFFFILE = False
 
 # ──────────────────────────────────────────────────────────────
 # 配置: 12个FOD类别（0-11编号对应存储）
@@ -42,38 +50,49 @@ IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.tif', '.
 
 @dataclass
 class Annotation:
-    """单个标注数据结构 — 内部使用像素坐标，序列化为JSON结构体"""
+    """单个标注数据结构 — 内部使用像素坐标，序列化为归一化比例(0~1)"""
     category: str          # 类别名称（显示用）
     x1: int                # 左上X (像素)
     y1: int                # 左上Y (像素)
     x2: int                # 右下X (像素)
     y2: int                # 右下Y (像素)
 
-    def to_dict(self) -> Dict[str, Any]:
-        """序列化为结构化字典（含{}分级嵌套）"""
+    def to_dict(self, img_w: int, img_h: int) -> Dict[str, Any]:
+        """序列化为结构化字典，bbox用归一化比例存储（0~1，缩放不变）"""
         return {
             "id": CATEGORY_TO_ID.get(self.category, -1),
             "name": self.category,
             "bbox": {
-                "x1": self.x1,
-                "y1": self.y1,
-                "x2": self.x2,
-                "y2": self.y2,
+                "x1": round(self.x1 / img_w, 6),
+                "y1": round(self.y1 / img_h, 6),
+                "x2": round(self.x2 / img_w, 6),
+                "y2": round(self.y2 / img_h, 6),
             }
         }
 
     @staticmethod
-    def from_dict(d: Dict[str, Any]) -> Optional['Annotation']:
-        """从结构化字典反序列化"""
+    def from_dict(d: Dict[str, Any], img_w: int = 0, img_h: int = 0) -> Optional['Annotation']:
+        """从结构化字典反序列化，自动兼容旧格式（像素值>1）和新格式（归一化0~1）"""
         try:
             class_id = int(d["id"])
             bbox = d["bbox"]
+            x1, y1 = float(bbox["x1"]), float(bbox["y1"])
+            x2, y2 = float(bbox["x2"]), float(bbox["y2"])
+            # 检测格式：若任一值 > 1 则为旧格式像素值，否则为新格式比例
+            if max(x1, y1, x2, y2) > 1.0 and img_w > 0 and img_h > 0:
+                # 旧格式：绝对像素 → 直接取整
+                x1, y1, x2, y2 = int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2))
+            elif img_w > 0 and img_h > 0:
+                # 新格式：归一化比例 → 还原为像素
+                x1 = int(round(x1 * img_w))
+                y1 = int(round(y1 * img_h))
+                x2 = int(round(x2 * img_w))
+                y2 = int(round(y2 * img_h))
+            else:
+                # 无图像尺寸时保持原值
+                x1, y1, x2, y2 = int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2))
             category = ID_TO_CATEGORY.get(class_id, d.get("name", f"未知{class_id}"))
-            return Annotation(
-                category=category,
-                x1=int(bbox["x1"]), y1=int(bbox["y1"]),
-                x2=int(bbox["x2"]), y2=int(bbox["y2"]),
-            )
+            return Annotation(category=category, x1=x1, y1=y1, x2=x2, y2=y2)
         except (KeyError, ValueError, TypeError):
             return None
 
@@ -92,7 +111,10 @@ class FODAnnotationTool:
         self.image_folder: str = ""
         self.image_list: List[str] = []
         self.current_image_idx: int = -1
-        self.pil_image: Optional[Image.Image] = None   # 原始PIL图像
+        self.pil_image: Optional[Image.Image] = None   # 显示用图像（可能已下采样）
+        self.original_image_size: Tuple[int, int] = (0, 0)  # 原始图像尺寸（标注保存依据）
+        self.display_scale: float = 1.0               # 显示/原始比例 (1.0 或 1/3)
+        self.downsample_enabled: bool = False          # 是否启用3倍下采样
         self.tk_image: Optional[ImageTk.PhotoImage] = None
         self.zoom_scale: float = 1.0
         self.canvas_img_id: Optional[int] = None       # Canvas上图像对象的ID
@@ -174,6 +196,13 @@ class FODAnnotationTool:
         ttk.Button(ctrl_bar, text="原始大小", command=self.zoom_100, width=8).pack(side=tk.LEFT, padx=1)
         self.zoom_label = ttk.Label(ctrl_bar, text="100%", width=8, anchor='center')
         self.zoom_label.pack(side=tk.LEFT, padx=10)
+
+        # 下采样切换
+        self.downsample_var = tk.BooleanVar(value=False)
+        self.downsample_cb = ttk.Checkbutton(
+            ctrl_bar, text="3倍下采样", variable=self.downsample_var,
+            command=self._toggle_downsample)
+        self.downsample_cb.pack(side=tk.LEFT, padx=10)
 
         # 导航栏
         nav_bar = ttk.Frame(left_frame)
@@ -365,6 +394,160 @@ class FODAnnotationTool:
         self.current_image_idx = 0
         self._load_and_display()
 
+    @staticmethod
+    def _normalize_numpy(arr: np.ndarray) -> np.ndarray:
+        """将任意dtype的numpy数组归一化到8-bit [0, 255]"""
+        arr = arr.astype(np.float64, copy=True)
+        vmin = float(np.nanmin(arr))
+        vmax = float(np.nanmax(arr))
+        if vmax == vmin:
+            return np.zeros(arr.shape, dtype=np.uint8)
+        normalized = (arr - vmin) / (vmax - vmin) * 255.0
+        return normalized.clip(0, 255).astype(np.uint8)
+
+    @staticmethod
+    def _numpy_to_pil(arr: np.ndarray) -> Image.Image:
+        """将numpy数组(2D/3D)转换为PIL Image，自动归一化"""
+        if arr.ndim == 2:
+            # 单通道灰度
+            norm = FODAnnotationTool._normalize_numpy(arr)
+            return Image.fromarray(norm, mode='L')
+        elif arr.ndim == 3:
+            if arr.shape[0] in (1, 3, 4) and arr.shape[0] < arr.shape[1]:
+                # (C, H, W) channel-first 格式
+                if arr.shape[0] == 1:
+                    return FODAnnotationTool._numpy_to_pil(arr[0])
+                elif arr.shape[0] == 3:
+                    r = FODAnnotationTool._normalize_numpy(arr[0])
+                    g = FODAnnotationTool._normalize_numpy(arr[1])
+                    b = FODAnnotationTool._normalize_numpy(arr[2])
+                    return Image.fromarray(np.stack([r, g, b], axis=-1), mode='RGB')
+                else:
+                    # >3 channels: take first 3
+                    r = FODAnnotationTool._normalize_numpy(arr[0])
+                    g = FODAnnotationTool._normalize_numpy(arr[1])
+                    b = FODAnnotationTool._normalize_numpy(arr[2])
+                    return Image.fromarray(np.stack([r, g, b], axis=-1), mode='RGB')
+            elif arr.shape[2] in (1, 3, 4):
+                # (H, W, C) channel-last 格式
+                if arr.shape[2] == 1:
+                    return FODAnnotationTool._numpy_to_pil(arr[:, :, 0])
+                elif arr.shape[2] >= 3:
+                    r = FODAnnotationTool._normalize_numpy(arr[:, :, 0])
+                    g = FODAnnotationTool._normalize_numpy(arr[:, :, 1])
+                    b = FODAnnotationTool._normalize_numpy(arr[:, :, 2])
+                    return Image.fromarray(np.stack([r, g, b], axis=-1), mode='RGB')
+        # 兜底
+        arr_2d = arr.reshape(arr.shape[0], -1)
+        return FODAnnotationTool._numpy_to_pil(arr_2d)
+
+    def _load_image(self, img_path: str) -> Image.Image:
+        """加载图片：PIL优先，TIFF兜底使用tifffile → numpy → PIL"""
+        ext = os.path.splitext(img_path)[1].lower()
+        is_tiff = ext in ('.tiff', '.tif')
+
+        # ── 先尝试 PIL ──
+        pil_error = None
+        try:
+            img = Image.open(img_path)
+            img.load()  # 触发实际解码
+            # 对TIFF做快速检测：如果能正常获取像素信息则用PIL
+            if is_tiff:
+                try:
+                    extrema = img.getextrema()
+                    if extrema is None:
+                        raise ValueError("PIL getextrema 返回 None")
+                except Exception:
+                    pil_error = Exception("PIL无法解析该TIFF的像素数据")
+            if pil_error is None:
+                return self._normalize_image(img)
+        except Exception as e:
+            pil_error = e
+
+        # ── PIL 失败时，对 TIFF 使用 tifffile ──
+        if is_tiff and HAS_TIFFFILE:
+            try:
+                arr = _tifffile.imread(img_path)
+                arr = np.asarray(arr)
+                # 处理多页TIFF
+                if arr.ndim == 4 and arr.shape[0] > 1:
+                    arr = arr[0]  # 取第一页
+                # 若有batch维 (1, H, W) 或 (B, C, H, W)
+                while arr.ndim > 3:
+                    arr = arr[0]
+                img = self._numpy_to_pil(arr)
+                return self._normalize_image(img)
+            except Exception as e2:
+                raise Exception(
+                    f"PIL 和 tifffile 均无法读取该图片:\n"
+                    f"  PIL: {pil_error}\n"
+                    f"  tifffile: {e2}"
+                )
+
+        # ── 彻底失败 ──
+        if pil_error:
+            raise pil_error
+        raise Exception("无法读取该图片格式")
+
+    def _normalize_image(self, img: Image.Image) -> Image.Image:
+        """将任意bit深度/颜色模式的图像归一化为8-bit RGB，适配TIFF等高位深图片"""
+        mode = img.mode
+
+        # ── 处理多页TIFF：只取第一页 ──
+        try:
+            img.seek(0)
+        except Exception:
+            pass
+
+        # ── 模式转换：P(调色板) / 1(二值) / CMYK ──
+        if mode == '1':
+            img = img.convert('L')
+            mode = 'L'
+        elif mode == 'P':
+            img = img.convert('RGBA')
+            mode = 'RGBA'
+        elif mode == 'CMYK':
+            img = img.convert('RGB')
+            mode = 'RGB'
+
+        # ── 高位深灰度归一化到8-bit ──
+        high_depth_modes = {'I', 'F', 'I;16', 'I;16B', 'I;16L', 'I;32', 'I;32L'}
+        if mode in high_depth_modes:
+            # 统一转换到 I (32-bit) 方便处理
+            if mode != 'I':
+                try:
+                    img = img.convert('I')
+                except Exception:
+                    pass
+            # 获取像素值范围并拉伸到 0~255
+            extrema = img.getextrema()
+            vmin, vmax = extrema[0], extrema[1]
+            if vmax > vmin:
+                scale = 255.0 / (vmax - vmin)
+                img = img.point(lambda i: int(round((i - vmin) * scale)))
+            else:
+                img = img.point(lambda i: 0)
+            img = img.convert('L')
+            mode = 'L'
+
+        # ── 处理透明度通道 ──
+        if mode == 'RGBA':
+            bg = Image.new('RGB', img.size, (128, 128, 128))
+            bg.paste(img, mask=img.split()[3])
+            img = bg
+        elif mode == 'LA':
+            bg = Image.new('L', img.size, 255)
+            bg.paste(img, mask=img.split()[1])
+            img = bg.convert('RGB')
+        elif mode == 'L':
+            img = img.convert('RGB')
+
+        # ── 兜底：确保最终为 RGB ──
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+
+        return img
+
     def _load_and_display(self):
         """加载当前索引的图片并显示，自动搜索同名txt"""
         if self.current_image_idx < 0 or self.current_image_idx >= len(self.image_list):
@@ -372,10 +555,21 @@ class FODAnnotationTool:
 
         img_path = self.image_list[self.current_image_idx]
         try:
-            self.pil_image = Image.open(img_path)
+            raw_img = self._load_image(img_path)
         except Exception as e:
             messagebox.showerror("错误", f"无法打开图片:\n{img_path}\n\n{e}")
             return
+
+        # 记录原始尺寸（标注保存/加载依据）
+        self.original_image_size = raw_img.size
+
+        # 应用下采样（如启用）
+        if self.downsample_enabled:
+            self.pil_image = self._downsample_3x(raw_img)
+            self.display_scale = 1.0 / 3.0
+        else:
+            self.pil_image = raw_img
+            self.display_scale = 1.0
 
         # 保持当前缩放比例（首次加载时用fit_to_window初始化）
         if self.zoom_scale <= 0.05:
@@ -395,8 +589,13 @@ class FODAnnotationTool:
             self._load_annotations_from_file(txt_path)
             self._update_status(f"已加载已有标注: {os.path.basename(txt_path)}  ({len(self.annotations)} 条)")
         else:
-            self._update_status(f"已加载图片: {os.path.basename(img_path)}  "
-                                f"({self.pil_image.width}×{self.pil_image.height})")
+            ow, oh = self.original_image_size
+            dw, dh = self.pil_image.size
+            if ow != dw:
+                self._update_status(f"已加载图片: {os.path.basename(img_path)}  "
+                                    f"显示 {dw}×{dh}  (原始 {ow}×{oh})")
+            else:
+                self._update_status(f"已加载图片: {os.path.basename(img_path)}  ({dw}×{dh})")
 
         # 重绘（含已保存标注框）
         self._redraw_all()
@@ -414,26 +613,30 @@ class FODAnnotationTool:
     # 标注文件读写
     # ══════════════════════════════════════════════════════════
     def _save_annotations_to_file(self, filepath: str):
-        """将当前标注写入txt文件（JSON结构体，{}分级嵌套）"""
+        """将当前标注写入txt文件（JSON结构体，bbox以归一化比例0~1存储，基于原始尺寸）"""
         if self.pil_image is None:
             return
         try:
             os.makedirs(os.path.dirname(filepath), exist_ok=True)
-            data = [ann.to_dict() for ann in self.annotations]
+            iw, ih = self.original_image_size
+            data = [ann.to_dict(iw, ih) for ann in self.annotations]
             with open(filepath, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
         except Exception as e:
             messagebox.showerror("保存失败", f"无法写入标注文件:\n{filepath}\n\n{e}")
 
     def _load_annotations_from_file(self, filepath: str):
-        """从txt文件加载标注（JSON结构体 → Annotation列表）"""
+        """从txt文件加载标注（自动兼容旧像素格式和新归一化格式，基于原始尺寸）"""
         self.annotations.clear()
+        if self.pil_image is None:
+            return
+        iw, ih = self.original_image_size
         try:
             with open(filepath, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             if isinstance(data, list):
                 for item in data:
-                    ann = Annotation.from_dict(item)
+                    ann = Annotation.from_dict(item, iw, ih)
                     if ann:
                         self.annotations.append(ann)
         except Exception as e:
@@ -583,18 +786,39 @@ class FODAnnotationTool:
         self._redraw_all(keep_scroll=False)
 
     # ══════════════════════════════════════════════════════════
+    # 下采样（TIFF专用）
+    # ══════════════════════════════════════════════════════════
+    @staticmethod
+    def _downsample_3x(img: Image.Image) -> Image.Image:
+        """3倍stride下采样（取每第3个像素），用于多光谱TIFF"""
+        arr = np.array(img)
+        h, w = arr.shape[:2]
+        crop_h, crop_w = (h // 3) * 3, (w // 3) * 3
+        cropped = arr[:crop_h, :crop_w]
+        if cropped.ndim == 3:
+            down = cropped[0::3, 0::3, :]
+        else:
+            down = cropped[0::3, 0::3]
+        return Image.fromarray(down)
+
+    # ══════════════════════════════════════════════════════════
     # 坐标转换（图像始终位于Canvas坐标(0,0)，缩放原点即图像原点）
+    # 标注存储使用原始图像坐标，显示时通过 display_scale 映射
     # ══════════════════════════════════════════════════════════
     def _to_canvas(self, img_x: int, img_y: int) -> Tuple[float, float]:
-        """图像坐标 → Canvas坐标"""
-        return (img_x * self.zoom_scale, img_y * self.zoom_scale)
+        """原始图像坐标 → 显示坐标 → Canvas坐标"""
+        dx = img_x * self.display_scale
+        dy = img_y * self.display_scale
+        return (dx * self.zoom_scale, dy * self.zoom_scale)
 
     def _canvas_to_image(self, canvas_x: float, canvas_y: float) -> Tuple[int, int]:
-        """Canvas坐标 → 图像坐标
+        """Canvas坐标 → 显示坐标 → 原始图像坐标
         输入应为 canvas.canvasx/canvasy 转换后的Canvas坐标
         """
-        return (int(round(canvas_x / self.zoom_scale)),
-                int(round(canvas_y / self.zoom_scale)))
+        dx = canvas_x / self.zoom_scale
+        dy = canvas_y / self.zoom_scale
+        return (int(round(dx / self.display_scale)),
+                int(round(dy / self.display_scale)))
 
     # ══════════════════════════════════════════════════════════
     # 类别选择
@@ -631,8 +855,8 @@ class FODAnnotationTool:
         cy = self.canvas.canvasy(event.y)
         sx, sy = self.drag_start
 
-        # 计算图像坐标（绑定在图像范围内）
-        img_w, img_h = self.pil_image.size
+        # 计算图像坐标（绑定在原始图像范围内）
+        img_w, img_h = self.original_image_size
         i_x1, i_y1 = self._canvas_to_image(sx, sy)
         i_x2, i_y2 = self._canvas_to_image(cx, cy)
 
@@ -700,8 +924,8 @@ class FODAnnotationTool:
         idx = idx_map[key]
 
         new_val = self.current_bbox[idx] + step
-        # 钳位
-        img_w, img_h = self.pil_image.size
+        # 钳位（基于原始图像尺寸）
+        img_w, img_h = self.original_image_size
         max_vals = [img_w, img_h, img_w, img_h]
         new_val = max(0, min(new_val, max_vals[idx]))
 
@@ -729,7 +953,7 @@ class FODAnnotationTool:
             return
         idx_map = {'x1': 0, 'y1': 1, 'x2': 2, 'y2': 3}
         idx = idx_map[key]
-        img_w, img_h = self.pil_image.size
+        img_w, img_h = self.original_image_size
         max_vals = [img_w, img_h, img_w, img_h]
         val = max(0, min(val, max_vals[idx]))
 
@@ -873,6 +1097,24 @@ class FODAnnotationTool:
             )
 
     # ══════════════════════════════════════════════════════════
+    # 下采样切换
+    # ══════════════════════════════════════════════════════════
+    def _toggle_downsample(self):
+        """切换3倍下采样模式，重新加载当前图像"""
+        self.downsample_enabled = self.downsample_var.get()
+        if self.pil_image is None:
+            return
+        # 询问是否保存当前标注
+        if self.annotations and self.current_bbox is not None:
+            if messagebox.askyesno("切换模式", "切换下采样模式将丢失未提交的标注框，是否继续？"):
+                pass
+            else:
+                self.downsample_var.set(not self.downsample_enabled)
+                return
+        self.clear_current_bbox()
+        self._load_and_display()
+
+    # ══════════════════════════════════════════════════════════
     # 导航
     # ══════════════════════════════════════════════════════════
     def prev_image(self):
@@ -1009,6 +1251,7 @@ def main():
             break
 
     style.configure('TButton', font=FONT_BASE)
+    style.configure('TCheckbutton', font=FONT_BASE)
     style.configure('TLabel', font=FONT_BASE)
     style.configure('TLabelframe.Label', font=FONT_BOLD)
     style.configure('TEntry', font=FONT_BASE)
