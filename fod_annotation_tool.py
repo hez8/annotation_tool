@@ -130,6 +130,28 @@ class FODAnnotationTool:
 
         self.save_directory: str = ""                  # 自定义保存目录（空=图片同目录）
 
+        # 有效工作区域
+        self.work_region: Optional[List[int]] = None   # [x1, y1, x2, y2] 图像坐标
+        self.drawing_work_region: bool = False         # 正在绘制工作区域
+        self.work_region_rect_id: Optional[int] = None  # 工作区域绿色框 Canvas ID
+        self.work_region_dim_ids: List[int] = []        # 工作区域角标 Canvas ID
+        self.work_region_adjust_mode: bool = False     # 微调面板控制工作区域模式
+
+        # 配准变换 (双相机投影)
+        self.reg_points_src: List[Tuple[int, int]] = []   # 源图配准点(图像坐标)
+        self.reg_points_dst: List[Tuple[int, int]] = []   # 目标图配准点(图像坐标)
+        self.registration_active: bool = False            # 配准点采集模式
+        self.registration_stage: str = ""                 # "src" / "dst"
+        self.reg_marker_ids: List[int] = []               # 配准点标记 Canvas ID
+        self.homography_matrix: Optional[np.ndarray] = None  # 3x3 单应性矩阵
+        self.reg_source_thumbnail: Optional[ImageTk.PhotoImage] = None  # 源图缩略图(含配准点)
+        self.reg_thumb_id: Optional[int] = None            # 缩略图 Canvas ID
+        self.source_annotation_folder: str = ""            # 源标注文件夹（批量投影）
+        self.auto_project_enabled: bool = False            # 自动投影开关
+
+        # 长按连续调整
+        self._adjust_repeat_id: Optional[str] = None       # after ID for repeat
+
         # ── 构建界面 ──
         self._setup_menu()
         self._setup_ui()
@@ -266,6 +288,91 @@ class FODAnnotationTool:
                                   foreground='#888', font=('Microsoft YaHei UI', 22, 'bold'))
         self.cat_hint.pack(fill=tk.X, padx=5, pady=(2, 0))
 
+        # ── 有效工作区域 ──
+        wr_lf = ttk.LabelFrame(right_frame, text="有效工作区域")
+        wr_lf.pack(fill=tk.X, padx=3, pady=4)
+
+        wr_btn_row = ttk.Frame(wr_lf)
+        wr_btn_row.pack(fill=tk.X, padx=4, pady=3)
+        self.wr_toggle_btn = ttk.Button(wr_btn_row, text="设置工作区域",
+                                         command=self._toggle_work_region_mode)
+        self.wr_toggle_btn.pack(side=tk.LEFT, padx=2)
+        self.wr_clear_btn = ttk.Button(wr_btn_row, text="清除",
+                                        command=self._clear_work_region)
+        self.wr_clear_btn.pack(side=tk.LEFT, padx=2)
+        self.wr_status_label = ttk.Label(wr_btn_row, text="未设置", foreground='gray')
+        self.wr_status_label.pack(side=tk.LEFT, padx=6)
+
+        wr_adj_row = ttk.Frame(wr_lf)
+        wr_adj_row.pack(fill=tk.X, padx=4, pady=(0, 3))
+        self.wr_adjust_var = tk.BooleanVar(value=False)
+        self.wr_adjust_cb = ttk.Checkbutton(
+            wr_adj_row, text="微调模式", variable=self.wr_adjust_var,
+            command=self._toggle_work_region_adjust)
+        self.wr_adjust_cb.pack(side=tk.LEFT, padx=2)
+        ttk.Label(wr_adj_row, text="(勾选后左侧微调面板控制工作区域)",
+                  foreground='gray').pack(side=tk.LEFT, padx=4)
+
+        # ── 配准变换 (双相机投影) ──
+        reg_lf = ttk.LabelFrame(right_frame, text="配准变换 (双相机投影)")
+        reg_lf.pack(fill=tk.X, padx=3, pady=4)
+
+        # 配准点采集行
+        reg_pt_row = ttk.Frame(reg_lf)
+        reg_pt_row.pack(fill=tk.X, padx=4, pady=3)
+        self.reg_src_btn = ttk.Button(reg_pt_row, text="采源图点",
+                                       command=lambda: self._start_registration("src"))
+        self.reg_src_btn.pack(side=tk.LEFT, padx=1)
+        self.reg_dst_btn = ttk.Button(reg_pt_row, text="采目标图点",
+                                       command=lambda: self._start_registration("dst"))
+        self.reg_dst_btn.pack(side=tk.LEFT, padx=1)
+        self.reg_undo_btn = ttk.Button(reg_pt_row, text="撤销上一点",
+                                        command=self._undo_last_registration_point)
+        self.reg_undo_btn.pack(side=tk.LEFT, padx=1)
+        self.reg_clear_btn = ttk.Button(reg_pt_row, text="清除全部点",
+                                         command=self._clear_registration)
+        self.reg_clear_btn.pack(side=tk.LEFT, padx=1)
+        self.reg_status_label = ttk.Label(reg_pt_row, text="源:0 目标:0", foreground='gray')
+        self.reg_status_label.pack(side=tk.LEFT, padx=6)
+
+        # 矩阵操作行
+        reg_mat_row = ttk.Frame(reg_lf)
+        reg_mat_row.pack(fill=tk.X, padx=4, pady=(0, 3))
+        self.reg_compute_btn = ttk.Button(reg_mat_row, text="计算并保存矩阵",
+                                           command=self._compute_and_save_homography)
+        self.reg_compute_btn.pack(side=tk.LEFT, padx=1)
+        self.reg_load_btn = ttk.Button(reg_mat_row, text="加载矩阵",
+                                        command=self._load_homography_from_file)
+        self.reg_load_btn.pack(side=tk.LEFT, padx=1)
+        self.reg_matrix_label = ttk.Label(reg_mat_row, text="矩阵: 未设置", foreground='gray')
+        self.reg_matrix_label.pack(side=tk.LEFT, padx=4)
+
+        # 投影操作行
+        reg_proj_row = ttk.Frame(reg_lf)
+        reg_proj_row.pack(fill=tk.X, padx=4, pady=(0, 3))
+        self.reg_project_btn = ttk.Button(reg_proj_row, text="从源图投影标注",
+                                           command=self._project_annotations_from_source)
+        self.reg_project_btn.pack(side=tk.LEFT, padx=1)
+
+        # 批量投影行
+        reg_batch_row = ttk.Frame(reg_lf)
+        reg_batch_row.pack(fill=tk.X, padx=4, pady=(0, 3))
+        self.reg_folder_btn = ttk.Button(reg_batch_row, text="源标注文件夹",
+                                          command=self._select_source_annotation_folder)
+        self.reg_folder_btn.pack(side=tk.LEFT, padx=1)
+        self.auto_project_var = tk.BooleanVar(value=False)
+        self.auto_project_cb = ttk.Checkbutton(
+            reg_batch_row, text="自动投影", variable=self.auto_project_var,
+            command=self._toggle_auto_project)
+        self.auto_project_cb.pack(side=tk.LEFT, padx=4)
+
+        # 文件夹状态行
+        reg_status_row = ttk.Frame(reg_lf)
+        reg_status_row.pack(fill=tk.X, padx=4, pady=(0, 3))
+        self.reg_folder_status = ttk.Label(reg_status_row, text="源文件夹: 未选择",
+                                           foreground='gray')
+        self.reg_folder_status.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
         # ── 标注框微调 ──
         adj_lf = ttk.LabelFrame(right_frame, text="标注框微调 (图像坐标)")
         adj_lf.pack(fill=tk.X, padx=3, pady=4)
@@ -284,15 +391,23 @@ class FODAnnotationTool:
             var = tk.IntVar(value=0)
             self.adjust_vars[key] = var
 
-            ttk.Button(row_f, text="◀", width=3,
-                       command=lambda k=key: self.adjust_box(k, -1)).pack(side=tk.LEFT, padx=1)
+            btn_minus = ttk.Button(row_f, text="◀", width=3,
+                                    command=lambda k=key: self.adjust_box(k, -1))
+            btn_minus.bind('<ButtonPress-1>', lambda e, k=key: self._start_repeat_timer(k, -1))
+            btn_minus.bind('<ButtonRelease-1>', lambda e: self._stop_adjust_repeat())
+            btn_minus.bind('<Leave>', lambda e: self._stop_adjust_repeat())
+            btn_minus.pack(side=tk.LEFT, padx=1)
             entry = ttk.Entry(row_f, textvariable=var, width=7, justify='center')
             entry.pack(side=tk.LEFT, padx=2)
             entry.bind('<Return>', lambda e, k=key: self._on_entry_commit(k))
             entry.bind('<FocusOut>', lambda e, k=key: self._on_entry_commit(k))
             self.adjust_entries[key] = entry
-            ttk.Button(row_f, text="▶", width=3,
-                       command=lambda k=key: self.adjust_box(k, 1)).pack(side=tk.LEFT, padx=1)
+            btn_plus = ttk.Button(row_f, text="▶", width=3,
+                                   command=lambda k=key: self.adjust_box(k, 1))
+            btn_plus.bind('<ButtonPress-1>', lambda e, k=key: self._start_repeat_timer(k, 1))
+            btn_plus.bind('<ButtonRelease-1>', lambda e: self._stop_adjust_repeat())
+            btn_plus.bind('<Leave>', lambda e: self._stop_adjust_repeat())
+            btn_plus.pack(side=tk.LEFT, padx=1)
 
         # 步长选择
         step_f = ttk.Frame(adj_lf)
@@ -301,6 +416,13 @@ class FODAnnotationTool:
         self.step_var = tk.IntVar(value=1)
         ttk.Spinbox(step_f, from_=1, to=100, textvariable=self.step_var,
                     width=6).pack(side=tk.LEFT, padx=6)
+
+        # 标注框尺寸信息
+        size_f = ttk.Frame(adj_lf)
+        size_f.pack(fill=tk.X, padx=4, pady=(2, 0))
+        self.bbox_size_label = ttk.Label(size_f, text="宽: —  高: —  面积: —",
+                                         foreground='#555', anchor='center')
+        self.bbox_size_label.pack(fill=tk.X)
 
         # ── 操作按钮 ──
         btn_f = ttk.Frame(right_frame)
@@ -369,9 +491,11 @@ class FODAnnotationTool:
         self.root.bind('<Control-plus>', lambda e: self.zoom_in())
         self.root.bind('<Control-minus>', lambda e: self.zoom_out())
         self.root.bind('<Control-0>', lambda e: self.zoom_100())
-        self.root.bind('<Left>', lambda e: self.prev_image())
-        self.root.bind('<Right>', lambda e: self.next_image())
-        self.root.bind('<Escape>', lambda e: self.clear_current_bbox())
+        self.root.bind('<Left>', lambda e: self._on_arrow('left'))
+        self.root.bind('<Right>', lambda e: self._on_arrow('right'))
+        self.root.bind('<Up>', lambda e: self._on_arrow('up'))
+        self.root.bind('<Down>', lambda e: self._on_arrow('down'))
+        self.root.bind('<Escape>', lambda e: self._on_escape())
 
     # ══════════════════════════════════════════════════════════
     # 文件 / 图片操作
@@ -577,6 +701,16 @@ class FODAnnotationTool:
 
         # 清空标注
         self.annotations.clear()
+        self.work_region = None
+        self.wr_status_label.config(text="未设置", foreground='gray')
+        # 切换图片时退出配准模式（保留已采集的点数据和缩略图）
+        if self.registration_active:
+            self._clear_registration_markers()
+            self.registration_active = False
+            self.registration_stage = ""
+            self.reg_src_btn.state(['!pressed'])
+            self.reg_dst_btn.state(['!pressed'])
+        # 若有源图缩略图则保留（跨图配准需要）
         self.clear_current_bbox()
         self._refresh_tree()
 
@@ -600,6 +734,10 @@ class FODAnnotationTool:
         # 重绘（含已保存标注框）
         self._redraw_all()
 
+        # 自动投影（批量模式）
+        if self.auto_project_enabled:
+            self.root.after(100, self._try_auto_project)  # 延迟确保界面就绪
+
     def _get_txt_path(self) -> str:
         """获取当前图片对应的txt标注文件路径"""
         if self.current_image_idx < 0:
@@ -613,32 +751,79 @@ class FODAnnotationTool:
     # 标注文件读写
     # ══════════════════════════════════════════════════════════
     def _save_annotations_to_file(self, filepath: str):
-        """将当前标注写入txt文件（JSON结构体，bbox以归一化比例0~1存储，基于原始尺寸）"""
+        """将当前标注写入txt文件（JSON对象，含work_region和annotations，bbox归一化0~1存储）"""
         if self.pil_image is None:
             return
         try:
             os.makedirs(os.path.dirname(filepath), exist_ok=True)
             iw, ih = self.original_image_size
-            data = [ann.to_dict(iw, ih) for ann in self.annotations]
+            data = {
+                "image_width": iw,
+                "image_height": ih,
+                "annotations": [ann.to_dict(iw, ih) for ann in self.annotations]
+            }
+            # 工作区域（归一化坐标）
+            if self.work_region is not None:
+                wr_x1, wr_y1, wr_x2, wr_y2 = self.work_region
+                data["work_region"] = {
+                    "x1": round(wr_x1 / iw, 6),
+                    "y1": round(wr_y1 / ih, 6),
+                    "x2": round(wr_x2 / iw, 6),
+                    "y2": round(wr_y2 / ih, 6),
+                }
             with open(filepath, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
         except Exception as e:
             messagebox.showerror("保存失败", f"无法写入标注文件:\n{filepath}\n\n{e}")
 
     def _load_annotations_from_file(self, filepath: str):
-        """从txt文件加载标注（自动兼容旧像素格式和新归一化格式，基于原始尺寸）"""
+        """从txt文件加载标注（自动兼容旧数组格式和新对象格式，基于原始尺寸）"""
         self.annotations.clear()
+        self.work_region = None
         if self.pil_image is None:
             return
         iw, ih = self.original_image_size
         try:
             with open(filepath, 'r', encoding='utf-8') as f:
                 data = json.load(f)
+
             if isinstance(data, list):
+                # 旧格式: 纯数组，只有标注
                 for item in data:
                     ann = Annotation.from_dict(item, iw, ih)
                     if ann:
                         self.annotations.append(ann)
+            elif isinstance(data, dict):
+                # 新格式: {"annotations": [...], "work_region": {...}}
+                ann_list = data.get("annotations", [])
+                for item in ann_list:
+                    ann = Annotation.from_dict(item, iw, ih)
+                    if ann:
+                        self.annotations.append(ann)
+
+                # 加载工作区域
+                wr_data = data.get("work_region")
+                if wr_data:
+                    wr_x1 = float(wr_data["x1"])
+                    wr_y1 = float(wr_data["y1"])
+                    wr_x2 = float(wr_data["x2"])
+                    wr_y2 = float(wr_data["y2"])
+                    # 检测格式：归一化(<=1) 或 像素(>1)
+                    if max(wr_x1, wr_y1, wr_x2, wr_y2) <= 1.0:
+                        wr_x1 = int(round(wr_x1 * iw))
+                        wr_y1 = int(round(wr_y1 * ih))
+                        wr_x2 = int(round(wr_x2 * iw))
+                        wr_y2 = int(round(wr_y2 * ih))
+                    else:
+                        wr_x1 = int(round(wr_x1))
+                        wr_y1 = int(round(wr_y1))
+                        wr_x2 = int(round(wr_x2))
+                        wr_y2 = int(round(wr_y2))
+                    self.work_region = [wr_x1, wr_y1, wr_x2, wr_y2]
+                    self.wr_status_label.config(
+                        text=f"({wr_x1},{wr_y1})-({wr_x2},{wr_y2})", foreground='#00aa00')
+                else:
+                    self.wr_status_label.config(text="未设置", foreground='gray')
         except Exception as e:
             messagebox.showwarning("读取标注", f"读取标注文件出错:\n{filepath}\n\n{e}")
         self._refresh_tree()
@@ -695,6 +880,12 @@ class FODAnnotationTool:
                 self.canvas.xview_moveto(sx_prop)
                 self.canvas.yview_moveto(sy_prop)
 
+        # 绘制工作区域(绿色框 + 外部遮罩) — 在标注框下层
+        self._draw_work_region()
+
+        # 绘制配准点标记
+        self._draw_registration_markers()
+
         # 绘制已保存的标注框（蓝色）
         for ann in self.annotations:
             c_x1, c_y1 = self._to_canvas(ann.x1, ann.y1)
@@ -742,13 +933,42 @@ class FODAnnotationTool:
         )
 
     def _update_bbox_display(self):
-        """将current_bbox的值同步到微调输入框"""
-        if self.current_bbox is not None:
-            for key, val in zip(['x1', 'y1', 'x2', 'y2'], self.current_bbox):
+        """将当前编辑对象的坐标同步到微调输入框（标注框 / 工作区域 / 配准点）"""
+        # ── 配准模式：显示最近配准点坐标 ──
+        if self.registration_active:
+            points = self.reg_points_src if self.registration_stage == "src" else self.reg_points_dst
+            if points:
+                px, py = points[-1]
+                self.adjust_vars['x1'].set(px)
+                self.adjust_vars['y1'].set(py)
+                self.adjust_vars['x2'].set(px)
+                self.adjust_vars['y2'].set(py)
+            else:
+                for k in ['x1', 'y1', 'x2', 'y2']:
+                    self.adjust_vars[k].set(0)
+            self.bbox_size_label.config(text="配准点坐标", foreground='#555')
+            return
+
+        # ── 更新尺寸显示 ──
+        coords = None
+        if self.work_region_adjust_mode and self.work_region is not None:
+            coords = self.work_region
+        elif self.current_bbox is not None:
+            coords = self.current_bbox
+
+        if coords is not None:
+            for key, val in zip(['x1', 'y1', 'x2', 'y2'], coords):
                 self.adjust_vars[key].set(val)
+            w = coords[2] - coords[0]
+            h = coords[3] - coords[1]
+            area = w * h
+            self.bbox_size_label.config(
+                text=f"宽: {w}  高: {h}  面积: {area}",
+                foreground='#007acc')
         else:
             for key in ['x1', 'y1', 'x2', 'y2']:
                 self.adjust_vars[key].set(0)
+            self.bbox_size_label.config(text="宽: —  高: —  面积: —", foreground='#555')
 
     def zoom_in(self):
         """放大"""
@@ -839,10 +1059,41 @@ class FODAnnotationTool:
     # 鼠标画框交互
     # ══════════════════════════════════════════════════════════
     def _on_mouse_down(self, event):
-        if self.pil_image is None or self.current_category is None:
-            if self.current_category is None:
-                self._update_status("请先选择一个标注类别")
+        if self.pil_image is None:
             return
+        # 配准点采集模式
+        if self.registration_active:
+            cx = self.canvas.canvasx(event.x)
+            cy = self.canvas.canvasy(event.y)
+            ix, iy = self._canvas_to_image(cx, cy)
+            # 钳位
+            iw, ih = self.original_image_size
+            ix = max(0, min(ix, iw))
+            iy = max(0, min(iy, ih))
+            if self.registration_stage == "src":
+                self.reg_points_src.append((ix, iy))
+            else:
+                self.reg_points_dst.append((ix, iy))
+            self._draw_registration_markers()
+            self.reg_status_label.config(
+                text=f"源:{len(self.reg_points_src)} 目标:{len(self.reg_points_dst)}",
+                foreground='#cc9900')
+            sn = len(self.reg_points_src) if self.registration_stage == "src" else len(self.reg_points_dst)
+            self._update_status(f"已采集配准点 #{sn}: ({ix}, {iy})")
+            return
+        # 工作区域绘制模式（不需要选择类别）
+        if self.drawing_work_region:
+            self.drawing = True
+            self.drag_start = (self.canvas.canvasx(event.x), self.canvas.canvasy(event.y))
+            self.canvas.configure(cursor='crosshair')
+            return
+        if self.current_category is None:
+            self._update_status("请先选择一个标注类别")
+            return
+        # 开始画标注框时自动退出工作区域微调模式
+        if self.work_region_adjust_mode:
+            self.work_region_adjust_mode = False
+            self.wr_adjust_var.set(False)
         # 记录起始点（Canvas坐标）
         self.drawing = True
         self.drag_start = (self.canvas.canvasx(event.x), self.canvas.canvasy(event.y))
@@ -866,6 +1117,13 @@ class FODAnnotationTool:
         i_x2 = max(0, min(i_x2, img_w))
         i_y2 = max(0, min(i_y2, img_h))
 
+        if self.drawing_work_region:
+            # 工作区域绘制预览（轻量更新）
+            self.work_region = [min(i_x1, i_x2), min(i_y1, i_y2),
+                                max(i_x1, i_x2), max(i_y1, i_y2)]
+            self._redraw_work_region()
+            return
+
         self.current_bbox = [i_x1, i_y1, i_x2, i_y2]
         self._draw_preview_rect()
         self._update_bbox_display()
@@ -875,6 +1133,28 @@ class FODAnnotationTool:
             return
         self.drawing = False
         self.canvas.configure(cursor='crosshair')
+
+        # 工作区域绘制完成
+        if self.drawing_work_region:
+            self.drawing_work_region = False
+            self.wr_toggle_btn.config(text="设置工作区域")
+            if self.work_region is not None:
+                wr_x1, wr_y1, wr_x2, wr_y2 = self.work_region
+                if abs(wr_x2 - wr_x1) < 5 and abs(wr_y2 - wr_y1) < 5:
+                    self.work_region = None
+                    self.wr_status_label.config(text="未设置", foreground='gray')
+                    self._redraw_all()
+                    self._update_status("工作区域框太小，已忽略")
+                    return
+                self.wr_status_label.config(
+                    text=f"({wr_x1},{wr_y1})-({wr_x2},{wr_y2})", foreground='#00aa00')
+                # 自动进入微调模式
+                self.work_region_adjust_mode = True
+                self.wr_adjust_var.set(True)
+                self._update_bbox_display()
+                self._redraw_all()
+                self._update_status(f"工作区域已设置: ({wr_x1},{wr_y1}) → ({wr_x2},{wr_y2}) — 微调面板已切换")
+            return
 
         # 如果框太小（<3像素），视为无效
         if self.current_bbox is not None:
@@ -913,23 +1193,82 @@ class FODAnnotationTool:
     # ══════════════════════════════════════════════════════════
     # 微调框
     # ══════════════════════════════════════════════════════════
+    def _start_repeat_timer(self, key: str, delta: int):
+        """长按开始: 启动延迟定时器（单击由 command= 处理，不重复调用）"""
+        self._stop_adjust_repeat()
+        self._adjust_repeat_id = self.root.after(200,
+                                                  lambda: self._adjust_repeat(key, delta))
+
+    def _adjust_repeat(self, key: str, delta: int):
+        """长按重复循环（间隔40ms）"""
+        self.adjust_box(key, delta)
+        self._adjust_repeat_id = self.root.after(40,
+                                                  lambda: self._adjust_repeat(key, delta))
+
+    def _stop_adjust_repeat(self, event=None):
+        """停止长按重复"""
+        if self._adjust_repeat_id is not None:
+            self.root.after_cancel(self._adjust_repeat_id)
+            self._adjust_repeat_id = None
+
     def adjust_box(self, key: str, delta: int):
-        """微调框的某个参数"""
-        if self.current_bbox is None or self.pil_image is None:
-            self._update_status("请先选择类别并画框")
+        """微调框的某个参数（标注框 / 工作区域 / 配准点）"""
+        if self.pil_image is None:
             return
 
         step = self.step_var.get() * delta
         idx_map = {'x1': 0, 'y1': 1, 'x2': 2, 'y2': 3}
         idx = idx_map[key]
-
-        new_val = self.current_bbox[idx] + step
-        # 钳位（基于原始图像尺寸）
         img_w, img_h = self.original_image_size
         max_vals = [img_w, img_h, img_w, img_h]
+
+        # ── 配准模式：调整最近采集的配准点 ──
+        if self.registration_active:
+            points = self.reg_points_src if self.registration_stage == "src" else self.reg_points_dst
+            if not points:
+                self._update_status("请先在图像上点击采集配准点")
+                return
+            px, py = points[-1]
+            if key in ('x1', 'x2'):
+                px = max(0, min(img_w - 1, px + step))
+            else:
+                py = max(0, min(img_h - 1, py + step))
+            points[-1] = (px, py)
+            self._update_bbox_display()
+            self._draw_registration_markers()
+            sn = len(points)
+            self._update_status(f"配准点 #{sn}: ({px}, {py}) [微调面板调整]")
+            return
+
+        # ── 工作区域微调模式 ──
+        if self.work_region_adjust_mode and self.work_region is not None:
+            # 调整工作区域
+            new_val = self.work_region[idx] + step
+            new_val = max(0, min(new_val, max_vals[idx]))
+            if idx == 0:
+                new_val = min(new_val, self.work_region[2] - 1)
+            elif idx == 1:
+                new_val = min(new_val, self.work_region[3] - 1)
+            elif idx == 2:
+                new_val = max(new_val, self.work_region[0] + 1)
+            elif idx == 3:
+                new_val = max(new_val, self.work_region[1] + 1)
+            self.work_region[idx] = new_val
+            self._update_bbox_display()
+            self._redraw_all()
+            self.wr_status_label.config(
+                text=f"({self.work_region[0]},{self.work_region[1]})-"
+                     f"({self.work_region[2]},{self.work_region[3]})",
+                foreground='#00aa00')
+            return
+
+        if self.current_bbox is None:
+            self._update_status("请先选择类别并画框，或勾选工作区域「微调模式」")
+            return
+
+        new_val = self.current_bbox[idx] + step
         new_val = max(0, min(new_val, max_vals[idx]))
 
-        # x1 < x2, y1 < y2 约束
         if idx == 0:  # x1
             new_val = min(new_val, self.current_bbox[2] - 1)
         elif idx == 1:  # y1
@@ -944,8 +1283,8 @@ class FODAnnotationTool:
         self._update_bbox_display()
 
     def _on_entry_commit(self, key: str):
-        """用户手动输入框参数后回车/失焦"""
-        if self.current_bbox is None or self.pil_image is None:
+        """用户手动输入框参数后回车/失焦（标注框 / 工作区域 / 配准点）"""
+        if self.pil_image is None:
             return
         try:
             val = self.adjust_vars[key].get()
@@ -957,7 +1296,45 @@ class FODAnnotationTool:
         max_vals = [img_w, img_h, img_w, img_h]
         val = max(0, min(val, max_vals[idx]))
 
-        # 约束
+        # ── 配准模式：手动输入配准点坐标 ──
+        if self.registration_active:
+            points = self.reg_points_src if self.registration_stage == "src" else self.reg_points_dst
+            if not points:
+                return
+            px, py = points[-1]
+            if key in ('x1', 'x2'):
+                px = val
+            else:
+                py = val
+            points[-1] = (px, py)
+            self._update_bbox_display()
+            self._draw_registration_markers()
+            sn = len(points)
+            self._update_status(f"配准点 #{sn}: ({px}, {py}) [手动输入]")
+            return
+
+        if self.work_region_adjust_mode and self.work_region is not None:
+            # 调整工作区域
+            if idx == 0:
+                val = min(val, self.work_region[2] - 1)
+            elif idx == 1:
+                val = min(val, self.work_region[3] - 1)
+            elif idx == 2:
+                val = max(val, self.work_region[0] + 1)
+            elif idx == 3:
+                val = max(val, self.work_region[1] + 1)
+            self.work_region[idx] = val
+            self._update_bbox_display()
+            self._redraw_all()
+            self.wr_status_label.config(
+                text=f"({self.work_region[0]},{self.work_region[1]})-"
+                     f"({self.work_region[2]},{self.work_region[3]})",
+                foreground='#00aa00')
+            return
+
+        if self.current_bbox is None:
+            return
+
         if idx == 0:
             val = min(val, self.current_bbox[2] - 1)
         elif idx == 1:
@@ -1058,6 +1435,716 @@ class FODAnnotationTool:
         self.current_category = None
         self.cat_hint.config(text="当前类别: 未选择", foreground='#888')
         self._update_status("已撤销当前标注框")
+
+    # ══════════════════════════════════════════════════════════
+    # 有效工作区域
+    # ══════════════════════════════════════════════════════════
+    def _on_arrow(self, direction: str):
+        """方向键: 配准模式下微调配准点，否则切换图片"""
+        if self.registration_active:
+            self._nudge_registration_point(direction)
+            return
+        if direction == 'left':
+            self.prev_image()
+        elif direction == 'right':
+            self.next_image()
+
+    def _nudge_registration_point(self, direction: str):
+        """微调最近采集的配准点（1像素步长）"""
+        points = self.reg_points_src if self.registration_stage == "src" else self.reg_points_dst
+        if not points:
+            return
+        px, py = points[-1]
+        iw, ih = self.original_image_size
+        if direction == 'left':
+            px = max(0, px - 1)
+        elif direction == 'right':
+            px = min(iw - 1, px + 1)
+        elif direction == 'up':
+            py = max(0, py - 1)
+        elif direction == 'down':
+            py = min(ih - 1, py + 1)
+        points[-1] = (px, py)
+        # 更新配准点计数显示
+        sn = len(self.reg_points_src) if self.registration_stage == "src" else len(self.reg_points_dst)
+        self._update_status(f"配准点 #{sn}: ({px}, {py}) [方向键微调]")
+        self._draw_registration_markers()
+
+    def _on_escape(self):
+        """ESC: 取消配准模式 / 工作区域绘制 / 或撤销当前标注框"""
+        if self.registration_active:
+            self._stop_registration()
+            return
+        if self.drawing_work_region:
+            self.drawing_work_region = False
+            self.drawing = False
+            self.wr_toggle_btn.config(text="设置工作区域")
+            # 恢复之前的 work_region (如果有的话)
+            self._draw_work_region()
+            self._update_status("已取消工作区域绘制")
+            return
+        self.clear_current_bbox()
+
+    def _toggle_work_region_mode(self):
+        """进入/退出工作区域绘制模式"""
+        if self.pil_image is None:
+            return
+        if self.drawing_work_region:
+            # 取消绘制模式
+            self.drawing_work_region = False
+            self.drawing = False
+            self.wr_toggle_btn.config(text="设置工作区域")
+            self._update_status("已取消工作区域设置模式")
+        else:
+            # 进入绘制模式
+            self.drawing_work_region = True
+            self.wr_toggle_btn.config(text="绘制中... (ESC取消)")
+            self._update_status("请在图像上拖拽绘制有效工作区域框 (ESC取消)")
+
+    def _toggle_work_region_adjust(self):
+        """切换工作区域微调模式"""
+        self.work_region_adjust_mode = self.wr_adjust_var.get()
+        if self.work_region_adjust_mode:
+            if self.work_region is None:
+                self.wr_adjust_var.set(False)
+                self.work_region_adjust_mode = False
+                self._update_status("请先设置工作区域")
+                return
+            self._update_bbox_display()
+            self._update_status("微调面板当前控制: 工作区域 (绿色框)")
+        else:
+            self._update_bbox_display()
+            self._update_status("微调面板当前控制: 标注框")
+
+    def _clear_work_region(self):
+        """清除当前工作区域"""
+        if self.work_region is not None:
+            self.work_region = None
+            self.drawing_work_region = False
+            self.drawing = False
+            self.work_region_adjust_mode = False
+            self.wr_adjust_var.set(False)
+            self.wr_toggle_btn.config(text="设置工作区域")
+            self.wr_status_label.config(text="未设置", foreground='gray')
+            self._update_bbox_display()
+            self._redraw_all()
+            self._update_status("已清除工作区域")
+        else:
+            self._update_status("当前未设置工作区域")
+
+    def _draw_work_region(self):
+        """绘制工作区域(绿色框) — 由 _redraw_all 调用"""
+        # 清除旧的工作区域元素
+        if self.work_region_rect_id is not None:
+            self.canvas.delete(self.work_region_rect_id)
+            self.work_region_rect_id = None
+        for rid in self.work_region_dim_ids:
+            self.canvas.delete(rid)
+        self.work_region_dim_ids.clear()
+        self.canvas.delete('work_region_label')
+
+        if self.work_region is None or self.pil_image is None:
+            return
+
+        wr_x1, wr_y1, wr_x2, wr_y2 = self.work_region
+        c_x1, c_y1 = self._to_canvas(wr_x1, wr_y1)
+        c_x2, c_y2 = self._to_canvas(wr_x2, wr_y2)
+
+        # 四角标线 (L形角标，无填充，性能好)
+        corner_len = 20
+        for (cx, cy, dx, dy) in [
+            (c_x1, c_y1,  1,  1),  # 左上
+            (c_x2, c_y1, -1,  1),  # 右上
+            (c_x1, c_y2,  1, -1),  # 左下
+            (c_x2, c_y2, -1, -1),  # 右下
+        ]:
+            rid1 = self.canvas.create_line(cx, cy, cx + dx * corner_len, cy,
+                                           fill='#00ff00', width=3, tags='work_region')
+            rid2 = self.canvas.create_line(cx, cy, cx, cy + dy * corner_len,
+                                           fill='#00ff00', width=3, tags='work_region')
+            self.work_region_dim_ids.extend([rid1, rid2])
+
+        # 工作区域绿色边框(虚线，区别于标注框)
+        self.work_region_rect_id = self.canvas.create_rectangle(
+            c_x1, c_y1, c_x2, c_y2,
+            outline='#00ff00', width=2, dash=(8, 4), tags='work_region'
+        )
+        # 标签
+        self.canvas.create_text(
+            c_x1 + 4, c_y1 - 14 if c_y1 > 18 else c_y1 + 16,
+            text='工作区域', anchor='w', fill='#00ff00',
+            font=('Microsoft YaHei UI', 20, 'bold'), tags='work_region_label'
+        )
+
+    def _redraw_work_region(self):
+        """轻量更新工作区域视觉(拖拽时使用，不重绘整个 canvas)"""
+        if self.work_region_rect_id is not None:
+            self.canvas.delete(self.work_region_rect_id)
+            self.work_region_rect_id = None
+        for rid in self.work_region_dim_ids:
+            self.canvas.delete(rid)
+        self.work_region_dim_ids.clear()
+        self.canvas.delete('work_region_label')
+
+        if self.work_region is None:
+            return
+
+        wr_x1, wr_y1, wr_x2, wr_y2 = self.work_region
+        c_x1, c_y1 = self._to_canvas(wr_x1, wr_y1)
+        c_x2, c_y2 = self._to_canvas(wr_x2, wr_y2)
+
+        corner_len = 20
+        for (cx, cy, dx, dy) in [
+            (c_x1, c_y1,  1,  1),
+            (c_x2, c_y1, -1,  1),
+            (c_x1, c_y2,  1, -1),
+            (c_x2, c_y2, -1, -1),
+        ]:
+            rid1 = self.canvas.create_line(cx, cy, cx + dx * corner_len, cy,
+                                           fill='#00ff00', width=3, tags='work_region')
+            rid2 = self.canvas.create_line(cx, cy, cx, cy + dy * corner_len,
+                                           fill='#00ff00', width=3, tags='work_region')
+            self.work_region_dim_ids.extend([rid1, rid2])
+
+        self.work_region_rect_id = self.canvas.create_rectangle(
+            c_x1, c_y1, c_x2, c_y2,
+            outline='#00ff00', width=2, dash=(8, 4), tags='work_region'
+        )
+        self.canvas.create_text(
+            c_x1 + 4, c_y1 - 14 if c_y1 > 18 else c_y1 + 16,
+            text='工作区域', anchor='w', fill='#00ff00',
+            font=('Microsoft YaHei UI', 20, 'bold'), tags='work_region_label'
+        )
+
+    # ══════════════════════════════════════════════════════════
+    # 配准变换 (双相机投影)
+    # ══════════════════════════════════════════════════════════
+    def _start_registration(self, stage: str):
+        """进入配准点采集模式 (stage='src' or 'dst')"""
+        if self.pil_image is None:
+            return
+        if self.registration_active and self.registration_stage == stage:
+            # 再次点击同一按钮 → 退出
+            self._stop_registration()
+            return
+        # 退出其他模式
+        if self.drawing_work_region:
+            self.drawing_work_region = False
+            self.drawing = False
+            self.wr_toggle_btn.config(text="设置工作区域")
+        # 进入配准模式
+        self.registration_active = True
+        self.registration_stage = stage
+        # 高亮按钮
+        if stage == "src":
+            self.reg_src_btn.state(['pressed'])
+            self.reg_dst_btn.state(['!pressed'])
+        else:
+            self.reg_dst_btn.state(['pressed'])
+            self.reg_src_btn.state(['!pressed'])
+        self._update_status(f"配准模式: 请在图像上点击特征点 ({'源图' if stage == 'src' else '目标图'}) — 再次点击按钮退出")
+        self._redraw_all()  # 触发重绘以显示配准点标记和缩略图
+
+    def _stop_registration(self):
+        """退出配准点采集模式"""
+        # 退出源图采点时，创建缩略图供目标图采点参考
+        if self.registration_stage == "src" and self.reg_points_src:
+            self._create_registration_thumbnail()
+        self.registration_active = False
+        self.registration_stage = ""
+        self.reg_src_btn.state(['!pressed'])
+        self.reg_dst_btn.state(['!pressed'])
+        self._redraw_all()
+        self._update_status("已退出配准模式")
+
+    def _undo_last_registration_point(self):
+        """撤销最近采集的一个配准点（优先撤销当前活跃模式的点）"""
+        if self.registration_active:
+            points = self.reg_points_src if self.registration_stage == "src" else self.reg_points_dst
+        else:
+            # 未活跃时，优先撤销目标图点（通常是后采集的）
+            points = self.reg_points_dst if self.reg_points_dst else self.reg_points_src
+        if not points:
+            self._update_status("没有可撤销的配准点")
+            return
+        removed = points.pop()
+        self._draw_registration_markers()
+        if self.registration_active:
+            self._update_bbox_display()
+        self.reg_status_label.config(
+            text=f"源:{len(self.reg_points_src)} 目标:{len(self.reg_points_dst)}",
+            foreground='#cc9900' if (self.reg_points_src or self.reg_points_dst) else 'gray')
+        self._update_status(f"已撤销配准点: ({removed[0]}, {removed[1]})")
+        # 更新源图缩略图（源图点变化时）
+        if self.reg_points_src:
+            self._create_registration_thumbnail()
+        else:
+            self.reg_source_thumbnail = None
+
+    def _clear_registration(self):
+        """清除所有配准点数据"""
+        self.reg_points_src.clear()
+        self.reg_points_dst.clear()
+        self.reg_source_thumbnail = None
+        self._clear_registration_markers()
+        self.reg_status_label.config(text="源:0 目标:0", foreground='gray')
+        self._update_status("已清除所有配准点")
+
+    def _clear_registration_markers(self):
+        """清除配准点 Canvas 标记"""
+        for rid in self.reg_marker_ids:
+            self.canvas.delete(rid)
+        self.reg_marker_ids.clear()
+        self.canvas.delete('reg_marker')
+        # 清除缩略图
+        if self.reg_thumb_id is not None:
+            self.canvas.delete(self.reg_thumb_id)
+            self.reg_thumb_id = None
+
+    def _create_registration_thumbnail(self):
+        """为源图创建含配准点标记的缩略图，供目标图采点时参考"""
+        from PIL import ImageDraw
+        if self.pil_image is None or not self.reg_points_src:
+            self.reg_source_thumbnail = None
+            return
+        try:
+            max_w, max_h = 280, 210
+            thumb = self.pil_image.copy()
+            thumb.thumbnail((max_w, max_h), Image.LANCZOS)
+            tw, th = thumb.size
+            draw = ImageDraw.Draw(thumb)
+            # 缩放比例: 显示图像 → 缩略图
+            dw, dh = self.pil_image.size
+            sx = tw / dw
+            sy = th / dh
+            for i, (px, py) in enumerate(self.reg_points_src):
+                dx = px * self.display_scale
+                dy = py * self.display_scale
+                tx, ty = dx * sx, dy * sy
+                r = 5
+                draw.ellipse([tx - r, ty - r, tx + r, ty + r],
+                             fill='yellow', outline='#cc9900', width=1)
+                draw.text((tx + 7, ty - 8), str(i + 1), fill='white')
+            self.reg_source_thumbnail = ImageTk.PhotoImage(thumb)
+        except Exception:
+            self.reg_source_thumbnail = None
+
+    def _draw_registration_markers(self):
+        """绘制配准点标记 (带编号的黄色圆形+十字) 以及源图参考缩略图"""
+        self._clear_registration_markers()
+        if not self.registration_active:
+            return
+
+        points = self.reg_points_src if self.registration_stage == "src" else self.reg_points_dst
+        if not points:
+            return
+
+        for i, (px, py) in enumerate(points):
+            cx, cy = self._to_canvas(px, py)
+            r = 12
+            # 黄色填充圆
+            rid = self.canvas.create_oval(cx - r, cy - r, cx + r, cy + r,
+                                          fill='#ffff00', outline='#cc9900',
+                                          width=2, tags='reg_marker')
+            self.reg_marker_ids.append(rid)
+            # 编号文字
+            rid = self.canvas.create_text(cx, cy, text=str(i + 1),
+                                          fill='#000000',
+                                          font=('Microsoft YaHei UI', 16, 'bold'),
+                                          tags='reg_marker')
+            self.reg_marker_ids.append(rid)
+            # 十字线
+            rid = self.canvas.create_line(cx - 16, cy, cx + 16, cy,
+                                          fill='#cc9900', width=1, tags='reg_marker')
+            self.reg_marker_ids.append(rid)
+            rid = self.canvas.create_line(cx, cy - 16, cx, cy + 16,
+                                          fill='#cc9900', width=1, tags='reg_marker')
+            self.reg_marker_ids.append(rid)
+
+        # 目标图采点时，显示源图缩略图作为参考
+        if self.registration_stage == "dst" and self.reg_source_thumbnail is not None:
+            tw = self.reg_source_thumbnail.width()
+            th = self.reg_source_thumbnail.height()
+            pad = 10
+            # 放在 Canvas 右下角
+            cw = self.canvas.winfo_width()
+            ch = self.canvas.winfo_height()
+            if cw < 100:
+                cw = 800
+            if ch < 100:
+                ch = 600
+            x0, y0 = cw - tw - pad, ch - th - pad
+            # 半透明背景
+            rid = self.canvas.create_rectangle(
+                x0 - 3, y0 - 22, x0 + tw + 3, y0 + th + 3,
+                fill='#1a1a1a', outline='#cc9900', width=2, tags='reg_marker')
+            self.reg_marker_ids.append(rid)
+            self.reg_thumb_id = self.canvas.create_image(
+                x0, y0, anchor='nw', image=self.reg_source_thumbnail,
+                tags='reg_marker')
+            rid = self.canvas.create_text(
+                x0 + 4, y0 - 8, text='源图参考 (按序点击对应点)',
+                anchor='w', fill='#cc9900',
+                font=('Microsoft YaHei UI', 14, 'bold'), tags='reg_marker')
+            self.reg_marker_ids.append(rid)
+
+    @staticmethod
+    def _compute_homography_dlt(src_pts, dst_pts):
+        """DLT算法计算3x3单应性矩阵 (需要>=4对点)"""
+        A = []
+        for (x, y), (xp, yp) in zip(src_pts, dst_pts):
+            A.append([-x, -y, -1, 0, 0, 0, x * xp, y * xp, xp])
+            A.append([0, 0, 0, -x, -y, -1, x * yp, y * yp, yp])
+        A = np.array(A, dtype=np.float64)
+        _, _, Vt = np.linalg.svd(A)
+        H = Vt[-1].reshape(3, 3)
+        H = H / H[2, 2]
+        return H
+
+    def _compute_and_save_homography(self):
+        """计算单应性矩阵并保存到JSON文件"""
+        if len(self.reg_points_src) < 4 or len(self.reg_points_dst) < 4:
+            messagebox.showwarning("点数不足",
+                                   f"源图和目标图各需要至少4个配准点。\n"
+                                   f"当前: 源图 {len(self.reg_points_src)} 点, "
+                                   f"目标图 {len(self.reg_points_dst)} 点")
+            return
+        if len(self.reg_points_src) != len(self.reg_points_dst):
+            messagebox.showwarning("点数不匹配",
+                                   f"源图({len(self.reg_points_src)}点)和"
+                                   f"目标图({len(self.reg_points_dst)}点)点数不一致")
+            return
+
+        try:
+            H = self._compute_homography_dlt(self.reg_points_src, self.reg_points_dst)
+            self.homography_matrix = H
+        except Exception as e:
+            messagebox.showerror("计算失败", f"单应性矩阵计算失败:\n{e}")
+            return
+
+        # 保存
+        filepath = filedialog.asksaveasfilename(
+            title="保存单应性矩阵",
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            initialfile="homography.json"
+        )
+        if not filepath:
+            return
+
+        try:
+            data = {
+                "matrix": H.tolist(),
+            }
+            if self.pil_image:
+                data["dst_resolution"] = list(self.original_image_size)
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2)
+            self.homography_file = filepath
+            self.reg_matrix_label.config(
+                text=f"矩阵: {H[0,0]:.4f} {H[0,1]:.4f} ...", foreground='#00aa00')
+            self._update_status(f"单应性矩阵已保存: {os.path.basename(filepath)}")
+            messagebox.showinfo("成功",
+                                f"单应性矩阵已保存到:\n{filepath}\n\n"
+                                f"矩阵:\n{H[0]}\n{H[1]}\n{H[2]}")
+        except Exception as e:
+            messagebox.showerror("保存失败", f"无法保存矩阵文件:\n{e}")
+
+    def _load_homography_from_file(self):
+        """从JSON文件加载单应性矩阵"""
+        filepath = filedialog.askopenfilename(
+            title="加载单应性矩阵",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
+        )
+        if not filepath:
+            return
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            H = np.array(data["matrix"], dtype=np.float64)
+            if H.shape != (3, 3):
+                raise ValueError("矩阵形状不是3x3")
+            self.homography_matrix = H
+            self.homography_file = filepath
+            self.reg_matrix_label.config(
+                text=f"矩阵: {H[0,0]:.4f} {H[0,1]:.4f} ...", foreground='#00aa00')
+            self._update_status(f"已加载单应性矩阵: {os.path.basename(filepath)}")
+        except Exception as e:
+            messagebox.showerror("加载失败", f"无法加载矩阵文件:\n{e}")
+
+    @staticmethod
+    def _transform_point(x: float, y: float, H: np.ndarray) -> Tuple[float, float]:
+        """将点(x,y)通过3x3单应性矩阵H变换"""
+        p = np.array([x, y, 1.0])
+        pp = H @ p
+        return (pp[0] / pp[2], pp[1] / pp[2])
+
+    @staticmethod
+    def _transform_bbox(x1: int, y1: int, x2: int, y2: int,
+                        H: np.ndarray) -> Tuple[int, int, int, int]:
+        """将bbox四个角点通过单应性变换，返回轴对齐包围盒(AABB)"""
+        corners = [
+            FODAnnotationTool._transform_point(x1, y1, H),
+            FODAnnotationTool._transform_point(x2, y1, H),
+            FODAnnotationTool._transform_point(x1, y2, H),
+            FODAnnotationTool._transform_point(x2, y2, H),
+        ]
+        xs = [c[0] for c in corners]
+        ys = [c[1] for c in corners]
+        return (int(round(min(xs))), int(round(min(ys))),
+                int(round(max(xs))), int(round(max(ys))))
+
+    # ══════════════════════════════════════════════════════════
+    # 投影标注（核心逻辑 + 手动选择 + 批量自动）
+    # ══════════════════════════════════════════════════════════
+    def _project_from_txt_file(self, src_txt: str, silent: bool = False) -> int:
+        """从指定txt文件加载标注、变换并导入到当前图片。返回投影条数，失败返回-1"""
+        if self.pil_image is None:
+            return -1
+
+        # 加载源标注
+        try:
+            with open(src_txt, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as e:
+            if not silent:
+                messagebox.showerror("读取失败", f"无法读取源标注文件:\n{src_txt}\n\n{e}")
+            return -1
+
+        # 解析标注 (兼容新旧格式)
+        if isinstance(data, list):
+            ann_list = data
+        elif isinstance(data, dict):
+            ann_list = data.get("annotations", [])
+        else:
+            if not silent:
+                messagebox.showerror("格式错误", "无法识别标注文件格式")
+            return -1
+
+        if not ann_list:
+            return 0
+
+        # 获取源图尺寸
+        if isinstance(data, dict):
+            src_w = data.get("image_width", 0)
+            src_h = data.get("image_height", 0)
+        else:
+            src_w, src_h = 0, 0
+
+        # 检查坐标格式
+        first_bbox = ann_list[0].get("bbox", {})
+        is_normalized = max(float(first_bbox.get("x1", 0)), float(first_bbox.get("y1", 0)),
+                            float(first_bbox.get("x2", 0)), float(first_bbox.get("y2", 0))) <= 1.0
+
+        if is_normalized:
+            if src_w <= 0 or src_h <= 0:
+                from tkinter import simpledialog
+                src_w = simpledialog.askinteger("源图尺寸", "源图宽度(像素):",
+                                                minvalue=1, maxvalue=99999)
+                if src_w is None:
+                    return -1
+                src_h = simpledialog.askinteger("源图尺寸", "源图高度(像素):",
+                                                minvalue=1, maxvalue=99999)
+                if src_h is None:
+                    return -1
+        else:
+            src_w, src_h = 1, 1
+
+        H = self.homography_matrix
+
+        # 变换每个标注
+        projected_count = 0
+        for item in ann_list:
+            try:
+                bbox = item["bbox"]
+                if is_normalized:
+                    bx1 = float(bbox["x1"]) * src_w
+                    by1 = float(bbox["y1"]) * src_h
+                    bx2 = float(bbox["x2"]) * src_w
+                    by2 = float(bbox["y2"]) * src_h
+                else:
+                    bx1 = float(bbox["x1"])
+                    by1 = float(bbox["y1"])
+                    bx2 = float(bbox["x2"])
+                    by2 = float(bbox["y2"])
+
+                nx1, ny1, nx2, ny2 = self._transform_bbox(
+                    int(round(bx1)), int(round(by1)),
+                    int(round(bx2)), int(round(by2)), H)
+
+                iw, ih = self.original_image_size
+                nx1 = max(0, min(nx1, iw))
+                ny1 = max(0, min(ny1, ih))
+                nx2 = max(0, min(nx2, iw))
+                ny2 = max(0, min(ny2, ih))
+
+                if abs(nx2 - nx1) < 3 or abs(ny2 - ny1) < 3:
+                    continue
+
+                category = ID_TO_CATEGORY.get(int(item["id"]),
+                                              item.get("name", f"未知{int(item['id'])}"))
+                ann = Annotation(category=category,
+                                 x1=nx1, y1=ny1, x2=nx2, y2=ny2)
+                self.annotations.append(ann)
+                projected_count += 1
+            except (KeyError, ValueError, TypeError):
+                continue
+
+        # ── 投影源图的工作区域 ──
+        wr_projected = False
+        if isinstance(data, dict) and "work_region" in data:
+            wr = data["work_region"]
+            try:
+                if is_normalized:
+                    wx1 = float(wr["x1"]) * src_w
+                    wy1 = float(wr["y1"]) * src_h
+                    wx2 = float(wr["x2"]) * src_w
+                    wy2 = float(wr["y2"]) * src_h
+                else:
+                    wx1 = float(wr["x1"])
+                    wy1 = float(wr["y1"])
+                    wx2 = float(wr["x2"])
+                    wy2 = float(wr["y2"])
+
+                nwx1, nwy1, nwx2, nwy2 = self._transform_bbox(
+                    int(round(wx1)), int(round(wy1)),
+                    int(round(wx2)), int(round(wy2)), H)
+
+                iw, ih = self.original_image_size
+                nwx1 = max(0, min(nwx1, iw))
+                nwy1 = max(0, min(nwy1, ih))
+                nwx2 = max(0, min(nwx2, iw))
+                nwy2 = max(0, min(nwy2, ih))
+
+                if abs(nwx2 - nwx1) >= 5 and abs(nwy2 - nwy1) >= 5:
+                    self.work_region = [nwx1, nwy1, nwx2, nwy2]
+                    self.wr_status_label.config(
+                        text=f"({nwx1},{nwy1})-({nwx2},{nwy2})", foreground='#00aa00')
+                    wr_projected = True
+            except (KeyError, ValueError, TypeError):
+                pass
+
+        self._refresh_tree()
+        self._redraw_all()
+        txt_name = os.path.basename(src_txt)
+        wr_msg = " + 工作区域" if wr_projected else ""
+        self._update_status(
+            f"已从源图投影 {projected_count} 条标注{wr_msg} ({txt_name})")
+
+        if not silent:
+            messagebox.showinfo("投影完成",
+                                f"成功投影 {projected_count}/{len(ann_list)} 条标注{wr_msg}\n"
+                                f"来源: {txt_name}\n\n"
+                                f"请检查并微调后保存。")
+        return projected_count
+
+    def _project_annotations_from_source(self):
+        """手动选择源标注txt → 变换 → 导入到当前图片"""
+        if self.homography_matrix is None:
+            if not messagebox.askyesno("无变换矩阵",
+                                       "尚未设置单应性矩阵。是否先加载已有矩阵文件？"):
+                return
+            self._load_homography_from_file()
+            if self.homography_matrix is None:
+                return
+
+        if self.pil_image is None:
+            self._update_status("请先打开目标图片")
+            return
+
+        # 如果有源标注文件夹，默认定位到该文件夹
+        initial_dir = self.source_annotation_folder if self.source_annotation_folder else ""
+        src_txt = filedialog.askopenfilename(
+            title="选择源图标注文件 (txt)",
+            initialdir=initial_dir,
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
+        )
+        if not src_txt:
+            return
+
+        self._project_from_txt_file(src_txt)
+
+    def _select_source_annotation_folder(self):
+        """选择源标注文件夹（批量投影模式）"""
+        folder = filedialog.askdirectory(title="选择源标注文件夹（含txt文件）")
+        if not folder:
+            return
+        self.source_annotation_folder = folder
+        self._update_source_folder_display()
+        # 立即尝试投影当前图片
+        if self.auto_project_enabled:
+            self._try_auto_project()
+
+    def _toggle_auto_project(self):
+        """切换自动投影开关"""
+        self.auto_project_enabled = self.auto_project_var.get()
+        if self.auto_project_enabled:
+            if not self.source_annotation_folder:
+                self.auto_project_var.set(False)
+                self.auto_project_enabled = False
+                self._update_status("请先选择源标注文件夹")
+                return
+            self._update_status("自动投影已开启 — 切换图片时自动匹配源标注")
+            self._try_auto_project()
+        else:
+            self._update_status("自动投影已关闭")
+
+    def _try_auto_project(self):
+        """根据当前目标图片文件名，自动匹配源标注txt并投影"""
+        if not self.auto_project_enabled or not self.source_annotation_folder:
+            return
+        if self.homography_matrix is None or self.pil_image is None:
+            return
+        if not self.image_list:
+            return
+
+        current_img = self.image_list[self.current_image_idx]
+        base = os.path.splitext(os.path.basename(current_img))[0]
+        src_txt = os.path.join(self.source_annotation_folder, f"{base}.txt")
+
+        self._update_source_folder_display(base)
+
+        if os.path.exists(src_txt):
+            # 检查是否已有标注（避免重复投影覆盖已修改的标注）
+            if self.annotations:
+                if not messagebox.askyesno("已有标注",
+                                           f"当前图片已有 {len(self.annotations)} 条标注。\n"
+                                           f"自动投影将覆盖现有标注，是否继续？"):
+                    return
+                self.annotations.clear()
+            result = self._project_from_txt_file(src_txt, silent=True)
+            if result > 0:
+                self._update_status(
+                    f"已自动投影 {result} 条标注 ({base}.txt)")
+        else:
+            # 检查是否已经是源文件夹中的最后一个txt
+            all_txts = sorted([f for f in os.listdir(self.source_annotation_folder)
+                              if f.endswith('.txt')])
+            if all_txts:
+                last_base = os.path.splitext(all_txts[-1])[0]
+                # 按字母序比较当前文件名与最后一个txt
+                if base > last_base:
+                    messagebox.showinfo("序列结束",
+                                        f"源标注文件夹中已无更多匹配的txt文件。\n"
+                                        f"最后一个txt: {all_txts[-1]}\n"
+                                        f"当前图片: {os.path.basename(current_img)}")
+            self._update_status(f"未找到匹配的源标注: {base}.txt")
+
+    def _update_source_folder_display(self, current_base: str = ""):
+        """更新源文件夹状态显示"""
+        if not self.source_annotation_folder:
+            self.reg_folder_status.config(text="源文件夹: 未选择", foreground='gray')
+            return
+        folder_short = self.source_annotation_folder
+        if len(folder_short) > 30:
+            folder_short = "..." + folder_short[-27:]
+        if current_base:
+            self.reg_folder_status.config(
+                text=f"{folder_short}  |  {current_base}.txt",
+                foreground='#007acc')
+        else:
+            self.reg_folder_status.config(
+                text=f"源文件夹: {folder_short}", foreground='#555')
 
     def _refresh_tree(self):
         """刷新Treeview显示"""
@@ -1175,7 +2262,7 @@ class FODAnnotationTool:
     # 保存目录
     # ══════════════════════════════════════════════════════════
     def select_save_dir(self):
-        """选择自定义保存目录"""
+        """选择自定义保存目录，自动加载新目录下的标注"""
         d = filedialog.askdirectory(title="选择标注保存目录")
         if d:
             self.save_directory = d
@@ -1183,6 +2270,15 @@ class FODAnnotationTool:
         else:
             self.save_directory = ""
             self.save_dir_label.config(text="(图片同目录)", foreground='gray')
+        # 自动刷新：从新保存目录加载标注
+        if self.pil_image is not None:
+            txt_path = self._get_txt_path()
+            if os.path.exists(txt_path):
+                self._load_annotations_from_file(txt_path)
+                self._redraw_all()
+                self._update_status(f"已从新目录加载标注: {os.path.basename(txt_path)}  ({len(self.annotations)} 条)")
+            else:
+                self._update_status(f"保存目录已更改 (新目录中无已有标注)")
 
     # ══════════════════════════════════════════════════════════
     # 杂项
