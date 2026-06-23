@@ -231,8 +231,19 @@ class FODAnnotationTool:
         nav_bar.pack(fill=tk.X, padx=4, pady=4)
         self.btn_prev = ttk.Button(nav_bar, text="◀ 上一张", command=self.prev_image)
         self.btn_prev.pack(side=tk.LEFT, padx=2)
-        self.image_label = ttk.Label(nav_bar, text="未加载图片", anchor='center')
-        self.image_label.pack(side=tk.LEFT, padx=10, fill=tk.X, expand=True)
+
+        # 图片快速跳转下拉框 + 位置标签
+        jump_frame = ttk.Frame(nav_bar)
+        jump_frame.pack(side=tk.LEFT, padx=6, fill=tk.X, expand=True)
+        ttk.Label(jump_frame, text="跳转:").pack(side=tk.LEFT, padx=(0, 3))
+        self._combo_var = tk.StringVar()
+        self.image_combo = ttk.Combobox(jump_frame, textvariable=self._combo_var,
+                                        state='readonly', width=30)
+        self.image_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.image_combo.bind('<<ComboboxSelected>>', self._on_combo_select)
+        self.pos_label = ttk.Label(jump_frame, text="", width=12, anchor='center')
+        self.pos_label.pack(side=tk.RIGHT, padx=(6, 0))
+
         self.btn_next = ttk.Button(nav_bar, text="下一张 ▶", command=self.next_image)
         self.btn_next.pack(side=tk.RIGHT, padx=2)
 
@@ -1397,7 +1408,7 @@ class FODAnnotationTool:
                                    f"位置: {self.current_bbox}"):
                 self.next_annotation()  # 先存入列表
 
-        if not self.annotations:
+        if not self.annotations and self.work_region is None:
             if not messagebox.askyesno("确认", "当前图片没有任何标注，确定保存空文件？"):
                 return
 
@@ -1921,7 +1932,9 @@ class FODAnnotationTool:
                 messagebox.showerror("格式错误", "无法识别标注文件格式")
             return -1
 
-        if not ann_list:
+        # 检查是否有工作区域可投影
+        has_work_region = isinstance(data, dict) and "work_region" in data
+        if not ann_list and not has_work_region:
             return 0
 
         # 获取源图尺寸
@@ -1931,10 +1944,12 @@ class FODAnnotationTool:
         else:
             src_w, src_h = 0, 0
 
-        # 检查坐标格式
-        first_bbox = ann_list[0].get("bbox", {})
-        is_normalized = max(float(first_bbox.get("x1", 0)), float(first_bbox.get("y1", 0)),
-                            float(first_bbox.get("x2", 0)), float(first_bbox.get("y2", 0))) <= 1.0
+        # 检查坐标格式（无标注框时默认为归一化格式）
+        is_normalized = True
+        if ann_list:
+            first_bbox = ann_list[0].get("bbox", {})
+            is_normalized = max(float(first_bbox.get("x1", 0)), float(first_bbox.get("y1", 0)),
+                                float(first_bbox.get("x2", 0)), float(first_bbox.get("y2", 0))) <= 1.0
 
         if is_normalized:
             if src_w <= 0 or src_h <= 0:
@@ -2236,11 +2251,12 @@ class FODAnnotationTool:
                                    "当前有未提交的标注框，切换前是否保存？"):
                 self.next_annotation()
 
-        if self.annotations:
+        if self.annotations or self.work_region is not None:
             txt_path = self._get_txt_path()
             if not os.path.exists(txt_path):
                 if messagebox.askyesno("自动保存",
-                                       f"当前图片有 {len(self.annotations)} 条标注，"
+                                       f"当前图片有 {len(self.annotations)} 条标注"
+                                       f"{' + 工作区域' if self.work_region else ''}，"
                                        "是否保存后再切换？"):
                     self._save_annotations_to_file(txt_path)
                     self._update_status(f"已自动保存: {os.path.basename(txt_path)}")
@@ -2249,14 +2265,35 @@ class FODAnnotationTool:
                 self._save_annotations_to_file(txt_path)
 
     def _update_nav_label(self):
-        """更新导航标签"""
+        """更新导航标签和图片下拉列表"""
         if not self.image_list:
-            self.image_label.config(text="未加载图片")
+            self.pos_label.config(text="未加载图片")
+            self.image_combo['values'] = []
+            self._combo_var.set("")
             return
         total = len(self.image_list)
         cur = self.current_image_idx + 1
         fname = os.path.basename(self.image_list[self.current_image_idx])
-        self.image_label.config(text=f"[{cur}/{total}]  {fname}")
+        self.pos_label.config(text=f"[{cur}/{total}]")
+        # 更新下拉列表（每次切换图片/文件夹均重建，保证内容一致）
+        self.image_combo['values'] = [os.path.basename(p) for p in self.image_list]
+        self._combo_var.set(fname)
+
+    def _on_combo_select(self, event=None):
+        """下拉框选择图片后跳转"""
+        selected = self._combo_var.get()
+        if not selected or not self.image_list:
+            return
+        # 按文件名查找索引
+        for i, path in enumerate(self.image_list):
+            if os.path.basename(path) == selected:
+                if i == self.current_image_idx:
+                    return  # 同一张图，无需跳转
+                self._auto_save_if_needed()
+                self.current_image_idx = i
+                self._load_and_display()
+                return
+        self._update_status(f"未找到图片: {selected}")
 
     # ══════════════════════════════════════════════════════════
     # 保存目录
@@ -2303,7 +2340,7 @@ class FODAnnotationTool:
 
     def _on_close(self):
         """关闭窗口时的处理"""
-        if self.annotations:
+        if self.annotations or self.work_region is not None:
             if messagebox.askyesno("退出确认",
                                    "当前图片有未保存的标注，是否保存后退出？"):
                 txt_path = self._get_txt_path()
